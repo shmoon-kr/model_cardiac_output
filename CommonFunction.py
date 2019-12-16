@@ -327,8 +327,14 @@ def load_npz(t_data, ref='EV_SVV', to3d=False, trim=True, normalize_abp=False, i
         trim = datetime.timedelta(seconds=0)
 
     t = {'title': np.array(t_data['title']), 'timestamp': np.array(t_data['timestamp']),
-         'feature': np.array(t_data['feature']), 'abp': np.array(t_data['abp']), 'ppg': np.array(t_data['ppg']),
-         'abp_valid': np.array(t_data['abp_valid']), 'ppg_valid': np.array(t_data['ppg_valid'])}
+         'feature': np.array(t_data['feature']), 'abp': np.array(t_data['abp']),
+         'abp_valid': np.array(t_data['abp_valid'])}
+    try:
+        t['ppg'] = np.array(t_data['ppg'])
+        t['ppg_valid'] = np.array(t_data['ppg_valid'])
+    except KeyError:
+        pass
+
     col_dict = dict()
     for i in range(t['title'].shape[0]):
         col_dict[t['title'][i]] = i
@@ -337,7 +343,8 @@ def load_npz(t_data, ref='EV_SVV', to3d=False, trim=True, normalize_abp=False, i
     assert 0 <= input_len <= 1024, 'Wrong input vector length.'
     if input_len < 1024:
         t['abp'] = t['abp'][:, -input_len:]
-        t['ppg'] = t['ppg'][:, -input_len:]
+        if 'ppg' in t.keys():
+            t['ppg'] = t['ppg'][:, -input_len:]
 
     if normalize_abp:
         displacement = np.quantile(t['abp'], 0.01, axis=1)
@@ -368,13 +375,19 @@ def load_npz(t_data, ref='EV_SVV', to3d=False, trim=True, normalize_abp=False, i
                 contaminated.append(i)
             elif t['feature'][i, col_dict['T_Cycle_Begin']] >= t['feature'][i, col_dict['T_Cycle_End']]:
                 contaminated.append(i)
-            elif not (t['abp_valid'][i] and t['ppg_valid'][i]):
+            elif not t['abp_valid'][i]:
+                contaminated.append(i)
+            elif not t['ppg_valid'][i] if 'ppg_valid' in t.keys() else False:
                 contaminated.append(i)
     else:
         assert False, 'Npz file contains no data.'
 
     t['abp'] = np.delete(t['abp'], contaminated, 0)
-    t['ppg'] = np.delete(t['ppg'], contaminated, 0)
+    try:
+        t['ppg'] = np.delete(t['ppg'], contaminated, 0)
+    except KeyError:
+        pass
+
     t['feature'] = np.delete(t['feature'], contaminated, 0)
     t['timestamp'] = np.delete(t['timestamp'], contaminated, 0)
 
@@ -398,7 +411,8 @@ def load_npz(t_data, ref='EV_SVV', to3d=False, trim=True, normalize_abp=False, i
 
     if to3d:
         t['abp'] = t['abp'][:, :, np.newaxis]
-        t['ppg'] = t['ppg'][:, :, np.newaxis]
+        if 'ppg' in t.keys():
+            t['ppg'] = t['ppg'][:, :, np.newaxis]
         t['feature'] = t['feature'][:, :, np.newaxis]
 
     return t
