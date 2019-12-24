@@ -17,8 +17,8 @@ import matplotlib.pyplot as plt
 batch_size = 256
 learning_rate = 1e-4
 
-model_dir = '/home/shmoon/model_production'
-validation_dir = '/home/shmoon/Result/validation_production'
+model_dir = '/home/shmoon/model/production'
+validation_dir = '/home/shmoon/Result/validation'
 
 def derivative_matrix(input_size):
     mat = np.zeros((input_size, input_size), dtype=np.float32)
