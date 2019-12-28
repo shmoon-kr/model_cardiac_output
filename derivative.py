@@ -8,7 +8,7 @@ class Derivative1D(tf.keras.layers.Layer):
     def __init__(self, padding='valid', data_format='channels_last', **kwargs):
         self.padding = padding
         self.derivative_matrix = None
-        self.data_format = data_format
+        self.data_format = data_format.lower()
         super(Derivative1D, self).__init__(**kwargs)
 
     def build(self, input_shape):

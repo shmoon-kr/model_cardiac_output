@@ -1,16 +1,21 @@
+# python3 ./ModelsJM.py init -m sv_model_p1 -t VG_SV -b JCM -g 0 -d trn0 trn1
+# python3 ./ModelsJM.py dq -m sv_model_p0 -g 1 -v vdns -d trn0 trn1
+# python3 ./ModelsJM.py com -m sv_model_p0 -g 1 -v vdns
+# python3 ./ModelsJM.py step -m sv_model_p0 -g 1 -v vdns
+# python3 ./ModelsJM.py -t EV_SVV -m JCM -d trn0 trn1 trn2 trn3 -g 1 -f svv_jcm -r
+
 import os
 import csv
+import shutil
 import datetime
 import argparse
 import MySQLdb
 import CommonFunction as cf
 import tensorflow as tf
 import numpy as np
-import tensorflow.python.keras.backend as K
 from math import ceil, sqrt
-from sklearn.metrics import mean_squared_error
-from scipy.stats import pearsonr, trim_mean
-from tensorflow.python.keras import optimizers
+from scipy.stats import pearsonr, trim_mean, gmean
+from tensorflow.python.keras import optimizers, backend as K
 from tensorflow.python.keras.utils import to_categorical
 from tensorflow.python.keras.models import Sequential, Input, Model
 from tensorflow.python.keras.layers import Conv1D, MaxPool1D, AveragePooling1D, Dense, Dropout, Reshape, Concatenate, Flatten, Lambda
@@ -21,15 +26,15 @@ model_dir = '/home/shmoon/model/production'
 max_individual = 100
 
 parser = argparse.ArgumentParser(description='Build a production model.')
-parser.add_argument('action')
+parser.add_argument('command')
 parser.add_argument('-d', nargs='+', dest='d', help='Specify dataset.')
 parser.add_argument('-m', dest='model', help='Specify a model.')
 parser.add_argument('-b', dest='base', help='Specify a base model.')
 parser.add_argument('-g', dest='gpu', help='Specify GPUs.')
 parser.add_argument('-t', dest='target', help='Target variable.')
-parser.add_argument('-f', dest='file', help='Model file name.')
 parser.add_argument('-i', dest='isc', action='store_true', help='Use individual scale coefficient.')
-parser.add_argument('-r', dest='resume', action='store_true', help='Load weights and continue training.')
+parser.add_argument('-f', dest='file', help='New model file.')
+parser.add_argument('-r', dest='resume', help='Model file to continue.')
 parser.add_argument('-v', dest='vdn', help='Validation data set.')
 
 
@@ -62,7 +67,7 @@ def ModelJM():
     return model
 
 
-def ModelJCM(f=(8, 16, 32, 64), k=(12, 6, 4, 3), d=0, ind=max_individual):
+def ModelJCM(f=(8, 16, 32, 64), k=(12, 6, 4, 3), d=None, ind=max_individual):
 
     ABP = Input(shape=(1024, 1))
     DRV0 = Derivative1D(padding='same')(ABP)
@@ -141,12 +146,11 @@ def ModelJCM(f=(8, 16, 32, 64), k=(12, 6, 4, 3), d=0, ind=max_individual):
     # Conv -> (?, 4, 64)
     flat = Flatten()(F8)
 
-    if d in (0, 1):
-        OUTPUT_UNSCALED = Dense(1, activation='relu', kernel_initializer=tf.initializers.glorot_uniform())(flat)
-    else:
-        FC1 = Dense(d, activation='relu', kernel_initializer=tf.contrib.layers.xavier_initializer())(flat)
-        FC2 = Dense(d, activation='relu', kernel_initializer=tf.contrib.layers.xavier_initializer())(FC1)
-        OUTPUT_UNSCALED = Dense(1, activation='relu', kernel_initializer=tf.contrib.layers.xavier_initializer())(FC2)
+    if d is not None:
+        flat = Dense(d, activation='relu', kernel_initializer=tf.contrib.layers.xavier_initializer())(flat)
+        flat = Dense(d, activation='relu', kernel_initializer=tf.contrib.layers.xavier_initializer())(flat)
+
+    OUTPUT_UNSCALED = Dense(1, activation='relu', kernel_initializer=tf.initializers.glorot_uniform())(flat)
 
     IND = Input(shape=(ind, ), dtype='float32')
     WI = Dense(1, activation='relu', kernel_initializer='ones', use_bias=False)
@@ -155,7 +159,7 @@ def ModelJCM(f=(8, 16, 32, 64), k=(12, 6, 4, 3), d=0, ind=max_individual):
     return Model(inputs=ABP, outputs=OUTPUT_UNSCALED), Model(inputs=(ABP, IND), outputs=OUTPUT_SCALED), WI
 
 
-def ModelInitISC(ind=1):
+def ModelInitISC(ind=max_individual):
     UNSCALED = Input(shape=(1, ), dtype='float32')
     IND = Input(shape=(ind, ), dtype='float32')
     WI = Dense(1, activation='relu', kernel_initializer='ones', use_bias=False)
@@ -163,9 +167,41 @@ def ModelInitISC(ind=1):
     return Model(inputs=(UNSCALED, IND), outputs=SCALED), WI
 
 
-model_jm = ModelJM()
-model_jcm_unscaled, model_jcm_scaled, model_jcm_isc = ModelJCM(ind=100)
-model_init_isc, model_init_isc_w = ModelInitISC(ind=100)
+def GetInitISC(sv_unscaled, ind, sv_scaled):
+    model_init_isc, model_init_isc_w = ModelInitISC()
+    adam = optimizers.Adam(lr=1e-2, clipnorm=1.)
+    model_init_isc.compile(adam, loss='mean_squared_error', metrics=['mse'])
+    model_init_isc.summary()
+
+    sess = K.get_session()
+    sess.run(tf.global_variables_initializer())
+
+    last_mse = None
+    while True:
+        mse = model_init_isc.train_on_batch((sv_unscaled, ind), sv_scaled)[0]
+        if last_mse is None:
+            last_mse = mse
+        elif mse >= last_mse:
+            break
+        else:
+            last_mse = mse
+
+    return model_init_isc_w.get_weights()
+
+
+def get_model_info(name):
+    db = MySQLdb.connect(host='localhost', user='shmoon', password='ibsntxmes', db='sv_trend_model')
+    cursor = db.cursor()
+
+    query = "SELECT id, name, base, ref, param FROM model_k WHERE name ='%s'" % name
+    cursor.execute(query)
+    db.close()
+    model_info = cursor.fetchall()
+    if not len(model_info):
+        return None
+    assert len(model_info) == 1, 'Multiple models %s exist.' % name
+    return {'id': model_info[0][0], 'name': model_info[0][1], 'base': model_info[0][2], 'ref': model_info[0][3],
+            'param': model_info[0][4]}
 
 
 def train_model_jm(training_data):
@@ -197,15 +233,68 @@ def train_model_jm(training_data):
     return
 
 
-#def get_init_isc(target, unsclaed):
+def build_init_model(model_name, base, init_data, ref):
+    if base == 'JCM':
+        model_unscaled, model_scaled, model_isc = ModelJCM(ind=100)
+        adam = optimizers.Adam(lr=1e-4, clipnorm=1.)
+        model_unscaled.compile(adam, loss='mean_squared_error', metrics=['mse'])
+    else:
+        assert False
+
+    sess = K.get_session()
+
+    for d_init in init_data:
+        train_data = np.load(d_init, allow_pickle=True)
+        d = cf.load_npz(train_data, ref=ref, to3d=True, trim=True, normalize_abp=True)
+        col_dict = d['col_dict']
+
+        if len(d['timestamp']):
+            sess.run(tf.global_variables_initializer())
+            model_unscaled.fit(d['abp'], d['feature'][:, col_dict[ref]], epochs=3, batch_size=1024)
+            if model_unscaled.history.history['loss'][0] > model_unscaled.history.history['loss'][-1]:
+                model_path = os.path.join(model_dir, model_name)
+                if os.path.isdir(model_path) and not os.path.islink(model_path):
+                    shutil.rmtree(model_path)
+                elif os.path.exists(model_path):
+                    os.remove(model_path)
+                os.mkdir(model_path)
+                model_unscaled.save_weights(os.path.join(model_dir, model_name, 'init.h5'))
+
+                db = MySQLdb.connect(host='localhost', user='shmoon', password='ibsntxmes', db='sv_trend_model')
+                cursor = db.cursor()
+
+                query = "DELETE quality_index_k FROM model_k INNER JOIN quality_index_k "
+                query += "ON model_k.id = quality_index_k.model_id WHERE model_k.name='%s'" % model_name
+                cursor.execute(query)
+
+                query = "DELETE FROM model_k WHERE name='%s'" % model_name
+                cursor.execute(query)
+
+                query = "INSERT INTO model_k (name, base, ref, param) VALUES ('%s','%s','%s',NULL)" % (
+                model_name, base, ref)
+                cursor.execute(query)
+
+                db.commit()
+                db.close()
+
+                return True
+
+    return False
 
 
-def evaluate_data_quality(base_model, model_name, data, val_data, ref, epochs=500):
+def evaluate_data_quality(model_name, data, val_data, epochs=500):
     title = list()
     result_r_table = list()
 
-    if base_model == 'JCM':
+    model_info = get_model_info(model_name)
+
+    if model_info['base'] == 'JCM':
+        model_jcm_unscaled, model_jcm_scaled, model_jcm_isc = ModelJCM(ind=100)
+        adam_jcm = optimizers.Adam(lr=1e-4, clipnorm=1.)
+        model_jcm_unscaled.compile(adam_jcm, loss='mean_squared_error', metrics=['mse'])
         model = model_jcm_unscaled
+    else:
+        assert False
 
     title.append('dataset')
     tmp_npzs = list()
@@ -221,7 +310,7 @@ def evaluate_data_quality(base_model, model_name, data, val_data, ref, epochs=50
     for train_data_npz in data:
         # Initializes global variables in the graph.
         train_data = np.load(train_data_npz, allow_pickle=True)
-        d = cf.load_npz(train_data, ref=ref, to3d=True, trim=True, normalize_abp=True)
+        d = cf.load_npz(train_data, ref=model_info['ref'], to3d=True, trim=True, normalize_abp=True)
         col_dict = d['col_dict']
 
         if len(d['timestamp']):
@@ -230,19 +319,18 @@ def evaluate_data_quality(base_model, model_name, data, val_data, ref, epochs=50
 
             sess.run(tf.global_variables_initializer())
             model.load_weights(os.path.join(model_dir, model_name, 'init.h5'))
-            model.fit(d['abp'], d['feature'][:, col_dict[ref]], epochs=epochs, batch_size=1024)
+            model.fit(d['abp'], d['feature'][:, col_dict[model_info['ref']]], epochs=epochs, batch_size=1024)
 
             # Start populating the filename queue.
             for test_data_npz in val_data:
                 test_data = np.load(test_data_npz, allow_pickle=True)
-                d_test = cf.load_npz(test_data, ref=ref, to3d=True, trim=True, normalize_abp=True)
+                d_test = cf.load_npz(test_data, ref=model_info['ref'], to3d=True, trim=True, normalize_abp=True)
                 if len(d_test['timestamp']):
-                    if test_data_npz not in title:
+                    if os.path.basename(test_data_npz) not in title:
                         title.append(os.path.basename(test_data_npz))
                     predicted = model.predict(d_test['abp'])
                     predicted = cf.smoothing_result(predicted, d_test['timestamp'], type='datetime')
-                    error_pcr = pearsonr(d_test['feature'][:, col_dict[ref]], predicted)[0][0]
-                    error_rms = sqrt(mean_squared_error(d_test['feature'][:, col_dict[ref]], predicted))
+                    error_pcr = pearsonr(d_test['feature'][:, col_dict[model_info['ref']]], predicted)[0][0]
                     result_row.append(error_pcr if not np.isnan(error_pcr) else 0)
             if len(result_row) > 1:
                 result_row.append(sum(result_row[1:]) / len(result_row[1:]))
@@ -259,26 +347,17 @@ def evaluate_data_quality(base_model, model_name, data, val_data, ref, epochs=50
     db = MySQLdb.connect(host='localhost', user='shmoon', password='ibsntxmes', db='sv_trend_model')
     cursor = db.cursor()
 
-    query = "DELETE FROM quality_index WHERE model_name ='%s'" % model_name
-    cursor.execute(query)
-    query = "DELETE FROM model WHERE model_name ='%s'" % model_name
+    query = "DELETE FROM quality_index_k WHERE model_id = %d" % model_info['id']
     cursor.execute(query)
     db.commit()
 
-    model_type_int = 0
-
-    query = "INSERT INTO model (model_name, model_path, model_type) VALUES ('%s','%s',%d)" % (
-        model_name, os.path.join(model_dir, model_name), model_type_int)
-    cursor.execute(query)
-    db.commit()
-
-    with open(os.path.join('/home/shmoon/Result/corr_inter', args.file + '.csv'), 'w', newline='') as csvfile:
+    with open(os.path.join(model_dir, model_name, 'quality.csv'), 'w', newline='') as csvfile:
         cyclewriter = csv.writer(csvfile, delimiter=',', quotechar='|', quoting=csv.QUOTE_MINIMAL)
         cyclewriter.writerow(title)
         for i, row in enumerate(result_r_table):
-            query = 'INSERT INTO quality_index (model_name, file_name, file_path, quality_index) VALUES '
-            query += '(\'%s\', \'%s\', \'%s\', %f)' % (
-                model_name, os.path.basename(row[0]), os.path.dirname(row[0]), row[-1])
+            query = 'INSERT INTO quality_index_k (model_id, file_name, file_path, quality_index) VALUES '
+            query += '(\'%d\', \'%s\', \'%s\', %f)' % (
+                model_info['id'], os.path.basename(row[0]), os.path.dirname(row[0]), row[-1])
             cursor.execute(query)
             row[0] = os.path.basename(row[0])
             cyclewriter.writerow(row)
@@ -287,40 +366,31 @@ def evaluate_data_quality(base_model, model_name, data, val_data, ref, epochs=50
     return
 
 
-def build_combine_model(model_name, val_data, ref, epochs=50):
+def build_combine_model(model_name, val_data, epochs=100, validation_epochs=5):
+
+    model_info = get_model_info(model_name)
 
     db = MySQLdb.connect(host='localhost', user='shmoon', password='ibsntxmes', db='sv_trend_model')
     cursor = db.cursor()
 
-    query = "SELECT model_path, model_type FROM model WHERE model_name ='%s'" % model_name
-    cursor.execute(query)
-    model_info = cursor.fetchall()
-
-    assert len(model_info) == 1, 'Model %s infomation in DB is not valid.' % model_name
-    model_info = model_info[0]
-
-    query = "SELECT file_path, file_name, quality_index FROM quality_index WHERE model_name ='%s' ORDER BY quality_index DESC" % model_name
+    query = "SELECT file_path, file_name, quality_index FROM quality_index_k WHERE model_id =%d ORDER BY quality_index DESC" % model_info['id']
     cursor.execute(query)
 
     training_data = cursor.fetchall()
+    #training_data = training_data[:3]
+    #val_data = val_data[:3]
 
     title = list()
     title.append('dataset')
-    result_r_table = np.empty((len(training_data), len(val_data)))
 
     model_jcm_unscaled, model_jcm_scaled, model_jcm_isc = ModelJCM(ind=100)
     adam_jcm = optimizers.Adam(lr=1e-4, clipnorm=1.)
     model_jcm_unscaled.compile(adam_jcm, loss='mean_squared_error', metrics=['mse'])
     model_jcm_scaled.compile(adam_jcm, loss='mean_squared_error', metrics=['mse'])
 
-    model_init_isc, model_init_isc_w = ModelInitISC(ind=100)
-    adam = optimizers.Adam(lr=1e-2, clipnorm=1.)
-    model_init_isc.compile(adam, loss='mean_squared_error', metrics=['mse'])
-    model_init_isc.summary()
-
     sess = K.get_session()
     sess.run(tf.global_variables_initializer())
-    model_jcm_unscaled.load_weights(os.path.join(model_info[0], 'origin.h5'))
+    model_jcm_unscaled.load_weights(os.path.join(model_dir, model_info['name'], 'origin.h5'))
 
     training_abp = list()
     training_ind = list()
@@ -329,30 +399,41 @@ def build_combine_model(model_name, val_data, ref, epochs=50):
 
     for i, npz_training_data in enumerate(training_data):
         tmp_train_data = np.load(os.path.join(npz_training_data[0], npz_training_data[1]), allow_pickle=True)
-        d = cf.load_npz(tmp_train_data, ref=ref, to3d=True, trim=True, normalize_abp=True)
+        d = cf.load_npz(tmp_train_data, ref=model_info['ref'], to3d=True, trim=True, normalize_abp=True)
         col_dict = d['col_dict']
         training_abp.append(d['abp'])
         training_sv.append(cf.smoothing_result(model_jcm_unscaled.predict(d['abp'], batch_size=1024), d['timestamp'], type='datetime'))
         training_ind.append([i]*len(d['timestamp']))
-        training_sv_scaled.append(d['feature'][:, col_dict[ref]])
+        training_sv_scaled.append(d['feature'][:, col_dict[model_info['ref']]])
 
     total_training_sv = np.concatenate(training_sv)
     total_training_ind = to_categorical(np.concatenate(training_ind), num_classes=max_individual)
     total_training_sv_scaled = np.concatenate(training_sv_scaled)
 
-    last_mse = None
-    while True:
-        mse = model_init_isc.train_on_batch((total_training_sv, total_training_ind), total_training_sv_scaled)[0]
-        if last_mse is None:
-            last_mse = mse
-        elif mse >= last_mse:
-            break
-        else:
-            last_mse = mse
-
-    isc_weights = model_init_isc_w.get_weights()
+    isc_weights = GetInitISC(total_training_sv, total_training_ind, total_training_sv_scaled)
 
     del total_training_sv, total_training_ind, total_training_sv_scaled
+
+    global_optimum_pcr = 0
+    validation_data_x = list()
+    validation_data_ref = list()
+    validation_data_ts = list()
+    tmp_val_list = list()
+
+    for j, val_data_single in enumerate(val_data):
+        tmp_val_data = np.load(val_data_single, allow_pickle=True)
+        d_val = cf.load_npz(tmp_val_data, ref=model_info['ref'], to3d=True, trim=True, normalize_abp=True)
+        col_dict = d_val['col_dict']
+        if len(d_val['timestamp']):
+            tmp_val_list.append(val_data_single)
+            title.append(os.path.basename(val_data_single))
+            validation_data_x.append(d_val['abp'])
+            validation_data_ref.append(d_val['feature'][:, col_dict[model_info['ref']]])
+            validation_data_ts.append(d_val['timestamp'])
+    title.append('average')
+
+    val_data = tmp_val_list
+    result_r_table = np.empty((len(training_data), len(val_data)))
 
     for i in range(len(training_data)):
         # Initializes global variables in the graph.
@@ -361,28 +442,30 @@ def build_combine_model(model_name, val_data, ref, epochs=50):
         tmp_training_sv_scaled = np.concatenate(training_sv_scaled[:i+1])
 
         sess.run(tf.global_variables_initializer())
-        model_jcm_unscaled.load_weights(os.path.join(model_info[0], 'origin.h5'))
+        model_jcm_unscaled.load_weights(os.path.join(model_dir, model_info['name'], 'origin.h5'))
         model_jcm_isc.set_weights(isc_weights)
 
-        model_jcm_scaled.fit((tmp_training_abp, tmp_training_ind), tmp_training_sv_scaled, epochs=epochs, batch_size=1024)
-        model_jcm_unscaled.save(os.path.join(model_info[0], 'm_%03d.h5' % (i+1)))
+        total_elapsed_epochs = 0
+        local_optimum_pcr = None
 
-        for j, val_data_single in enumerate(val_data):
-            tmp_val_data = np.load(val_data_single, allow_pickle=True)
-            d_val = cf.load_npz(tmp_val_data, ref=ref, to3d=True, trim=True, normalize_abp=True)
-            col_dict = d_val['col_dict']
-            if len(d_val['timestamp']):
-                predicted = model_jcm_unscaled.predict(d_val['abp'], batch_size=1024)
-                predicted = cf.smoothing_result(predicted, d_val['timestamp'], type='datetime')
-                #predicted = cf.smoothing_result()
-                result_r_table[i, j] = pearsonr(d_val['feature'][:, col_dict[ref]], predicted)[0][0]
+        while total_elapsed_epochs < epochs:
+            model_jcm_scaled.fit((tmp_training_abp, tmp_training_ind), tmp_training_sv_scaled, epochs=validation_epochs,
+                                 batch_size=1024)
+            total_elapsed_epochs += validation_epochs
+            tmp_local_pcr = list()
+            for j, val_data_single in enumerate(val_data):
+                predicted = model_jcm_unscaled.predict(validation_data_x[j], batch_size=1024)
+                predicted = cf.smoothing_result(predicted, validation_data_ts[j], type='datetime')
+                tmp_local_pcr.append(pearsonr(validation_data_ref[j], predicted)[0][0])
+            if np.mean(tmp_local_pcr) > np.mean(local_optimum_pcr) if local_optimum_pcr is not None else True:
+                local_optimum_pcr = tmp_local_pcr
 
-    for val in val_data:
-        title.append(os.path.basename(val))
+        result_r_table[i] = local_optimum_pcr
+        if np.mean(local_optimum_pcr) > global_optimum_pcr:
+            global_optimum_pcr = np.mean(local_optimum_pcr)
+            model_jcm_unscaled.save(os.path.join(model_dir, model_info['name'], 'optimum.h5'))
 
-    title.append('average')
-
-    with open('/home/shmoon/Result/validation_production/%s.csv' % model_name, 'w', newline='') as csvfile:
+    with open(os.path.join(model_dir, model_info['name'], 'combine.csv'), 'w', newline='') as csvfile:
         cyclewriter = csv.writer(csvfile, delimiter=',', quotechar='|', quoting=csv.QUOTE_MINIMAL)
         cyclewriter.writerow(title)
         for i in range(len(training_data)):
@@ -394,131 +477,188 @@ def build_combine_model(model_name, val_data, ref, epochs=50):
     return
 
 
+def build_isc_step(model_name, val_data, total_steps=100, step_size=10, num_data=None):
+
+    model_info = get_model_info(model_name)
+
+    db = MySQLdb.connect(host='localhost', user='shmoon', password='ibsntxmes', db='sv_trend_model')
+    cursor = db.cursor()
+
+    query = "SELECT file_path, file_name, quality_index FROM quality_index_k WHERE model_id ='%d' ORDER BY quality_index DESC" % model_info['id']
+    if num_data is not None:
+        query += ' LIMIT %d' % num_data
+    cursor.execute(query)
+
+    training_data = cursor.fetchall()
+
+    title_pcr = list()
+    title_pcr.append('dataset')
+    title_isc = list()
+    title_isc.append('dataset')
+
+    model_unscaled, model_scaled, model_isc = ModelJCM(ind=100)
+    adam = optimizers.Adam(lr=1e-5, clipnorm=1.)
+    model_unscaled.compile(adam, loss='mean_squared_error', metrics=['mse'])
+    model_scaled.compile(adam, loss='mean_squared_error', metrics=['mse'])
+
+    sess = K.get_session()
+    sess.run(tf.global_variables_initializer())
+    model_unscaled.load_weights(os.path.join(model_dir, model_name, 'origin.h5'))
+
+    training_abp = list()
+    training_ind = list()
+    training_sv = list()
+    training_sv_scaled = list()
+
+    for i, npz_training_data in enumerate(training_data):
+        tmp_train_data = np.load(os.path.join(npz_training_data[0], npz_training_data[1]), allow_pickle=True)
+        d = cf.load_npz(tmp_train_data, ref=model_info['ref'], to3d=True, trim=True, normalize_abp=True)
+        col_dict = d['col_dict']
+        training_abp.append(d['abp'])
+        training_sv.append(cf.smoothing_result(model_unscaled.predict(d['abp'], batch_size=1024), d['timestamp'], type='datetime'))
+        training_ind.append([i]*len(d['timestamp']))
+        training_sv_scaled.append(d['feature'][:, col_dict[model_info['ref']]])
+        title_isc.append(npz_training_data[1])
+
+    training_abp = np.concatenate(training_abp)
+    training_sv = np.concatenate(training_sv)
+    training_ind = to_categorical(np.concatenate(training_ind), num_classes=max_individual)
+    training_sv_scaled = np.concatenate(training_sv_scaled)
+
+    init_isc = GetInitISC(training_sv, training_ind, training_sv_scaled)
+    model_isc.set_weights(init_isc)
+
+    isc_history = np.zeros((total_steps, len(training_data)))
+    pcr_history = np.zeros((total_steps, len(val_data)))
+
+    val_abp = list()
+    val_sv_scaled = list()
+    val_ts = list()
+
+    for i, npz in enumerate(val_data):
+        title_pcr.append(os.path.basename(npz))
+        tmp_val_data = np.load(npz, allow_pickle=True)
+        d = cf.load_npz(tmp_val_data, ref=model_info['ref'], to3d=True, trim=True, normalize_abp=True)
+        col_dict = d['col_dict']
+        val_abp.append(d['abp'])
+        val_sv_scaled.append(d['feature'][:, col_dict[model_info['ref']]])
+        val_ts.append(d['timestamp'])
+
+    row_title = list()
+    for i in range(total_steps):
+        row_title.append('step_%04d' % (i*step_size+step_size))
+        model_scaled.fit((training_abp, training_ind), training_sv_scaled, epochs=step_size, batch_size=1024)
+        tmp_isc = model_isc.get_weights()
+        for j, npz in enumerate(val_data):
+            t = cf.smoothing_result(model_unscaled.predict(val_abp[j], batch_size=1024), val_ts[j], type='datetime')
+            pcr_history[i, j] = pearsonr(val_sv_scaled[j], t)[0][0]
+        isc_history[i] = tmp_isc[0][:len(training_data), 0]
+
+    with open(os.path.join(model_dir, model_name, 'history_pcr.csv'), 'w', newline='') as csvfile:
+        cyclewriter = csv.writer(csvfile, delimiter=',', quotechar='|', quoting=csv.QUOTE_MINIMAL)
+        cyclewriter.writerow(title_pcr + ['average'])
+        for i in range(len(row_title)):
+            tmp_row = [row_title[i]]
+            tmp_row.extend(pcr_history[i])
+            tmp_row.append(np.mean(pcr_history[i]))
+            cyclewriter.writerow(tmp_row)
+
+    with open(os.path.join(model_dir, model_name, 'history_isc.csv'), 'w', newline='') as csvfile:
+        cyclewriter = csv.writer(csvfile, delimiter=',', quotechar='|', quoting=csv.QUOTE_MINIMAL)
+        cyclewriter.writerow(title_isc + ['average'])
+        for i in range(len(row_title)):
+            tmp_row = [row_title[i]]
+            tmp_row.extend(isc_history[i, :])
+            tmp_row.append(gmean(isc_history[i, :]))
+            cyclewriter.writerow(tmp_row)
+
+    return False
+
+
+def build_single_model(model_name, new_model_file, data, saved_file=None):
+    model_info = get_model_info(model_name)
+
+    if model_info['base'] == 'JCM':
+        model_unscaled, model_scaled, model_isc = ModelJCM(ind=100)
+        adam = optimizers.Adam(lr=1e-4, clipnorm=1.)
+        model_unscaled.compile(adam, loss='mean_squared_error', metrics=['mse'])
+    else:
+        assert False
+
+    x = list()
+    y = list()
+
+    for npz in data:
+        t_data = np.load(npz, allow_pickle=True)
+        d = cf.load_npz(t_data, ref=model_info['ref'], to3d=True, trim=True, normalize_abp=True, input_len=1024)
+        if d['timestamp'].shape[0]:
+            col_dict = d['col_dict']
+            x.append(d['abp'])
+            y.append(d['feature'][:, col_dict[args.target], :])
+
+    x = np.concatenate(x)
+    y = np.concatenate(y)
+    assert len(x) == len(y), 'Different lengths.'
+
+    if saved_file is None:
+        saved_file = 'init'
+    model_unscaled.load_weights(os.path.join(model_dir, model_info['name'], '%s.h5' % saved_file))
+    model_unscaled.fit(x, y, epochs=1000, batch_size=1024)
+    model_unscaled.save(os.path.join(model_dir, model_info['name'], '%s.h5' % new_model_file))
+    return
+
+
 if __name__ == "__main__":
     # execute only if run as a script
     args = parser.parse_args()
-
-    assert args.target in ('VG_SV', 'EV_SVV'), 'Wrong target %s' % args.target
-    assert args.model in ('JCM', 'JM'), 'Wrong model %s' % args.model
-    assert args.file is not None, 'No file name was specified.' % args.model
 
     if args.gpu is not None:
         os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
     data = list()
-    for d in args.d:
-        if d == 'trn0':
-            data.extend(trn0)
-        elif d == 'trn1':
-            data.extend(trn1)
-        elif d == 'trn2':
-            data.extend(trn2)
-        elif d == 'trn3':
-            data.extend(trn3)
-        elif d == 'vdns':
-            data.extend(vdns)
+    if args.d is not None:
+        for d in args.d:
+            if d == 'trn0':
+                data.extend(trn0)
+            elif d == 'trn1':
+                data.extend(trn1)
+            elif d == 'trn2':
+                data.extend(trn2)
+            elif d == 'trn3':
+                data.extend(trn3)
+            elif d == 'vdns':
+                data.extend(vdns)
 
     val_data = list()
-    if args.vdn == 'trn0':
-        val_data = trn0
-    elif args.vdn == 'trn1':
-        val_data = trn1
-    elif args.vdn == 'trn2':
-        val_data = trn2
-    elif args.vdn == 'trn3':
-        val_data = trn3
-    elif args.vdn == 'vdns':
-        val_data = vdns
+    if args.vdn is not None:
+        if args.vdn == 'trn0':
+            val_data = trn0
+        elif args.vdn == 'trn1':
+            val_data = trn1
+        elif args.vdn == 'trn2':
+            val_data = trn2
+        elif args.vdn == 'trn3':
+            val_data = trn3
+        elif args.vdn == 'vdns':
+            val_data = vdns
 
-    model = None
-
-    if args.base == 'JCM':
-        model = model_jcm_unscaled
-    elif args.base == 'JM':
-        model = model_jm
-
-    # build_combine_model(model, model_name, val_data, ref, epochs=50)
-    if args.action == 'isc':
-        evaluate_data_quality(args.model, args.file, data, val_data, args.target)
-    elif args.action == 'com':
-        build_combine_model(args.file, val_data, args.target)
+    if args.command == 'init':
+        assert args.target in ('VG_SV', 'EV_SVV'), 'Wrong target %s' % args.target
+        assert args.base in ('JCM', 'JM'), 'Wrong base model %s' % args.model
+        build_init_model(args.model, args.base, data, args.target)
+    elif args.command == 'dq':
+        assert args.model is not None, 'No model name was specified.' % args.model
+        evaluate_data_quality(args.model, data, val_data)
+    elif args.command == 'com':
+        assert args.model is not None, 'No model name was specified.' % args.model
+        build_combine_model(args.model, val_data)
+    elif args.command == 'step':
+        assert args.model is not None, 'No model name was specified.' % args.model
+        build_isc_step(args.model, val_data, num_data=53)
+    elif args.command == 'sng':
+        assert args.model is not None, 'No model name was specified.'
+        assert args.file is not None, 'No file name was specified.'
+        build_single_model(args.model, args.file, data, args.resume)
     else:
-        x = list()
-        y = list()
-
-        for npz in data:
-            t_data = np.load(npz, allow_pickle=True)
-            d = cf.load_npz(t_data, ref=args.target, to3d=True, trim=True, normalize_abp=True, input_len=input_len)
-            if d['timestamp'].shape[0]:
-                col_dict = d['col_dict']
-                x.append(d['abp'])
-                y.append(d['feature'][:, col_dict[args.target], :])
-
-        x = np.concatenate(x)
-        y = np.concatenate(y)
-        assert len(x) == len(y), 'Different lengths.'
-
-        if args.resume:
-            model.load_weights(os.path.join(model_dir, '%s.h5' % args.file))
-        model.fit(x, y, epochs=1000, batch_size=1024)
-        model.save(os.path.join(model_dir, '%s.h5' % args.file))
-
-
-def GetInitISC():
-    model_jcm_unscaled, model_jcm_scaled, model_jcm_isc = ModelJCM()
-    adam_jcm = optimizers.Adam(lr=1e-4, clipnorm=1.)
-    model_jcm_unscaled.compile(adam_jcm, loss='mean_squared_error', metrics=['mse'])
-    model_jcm_isc.compile(adam_jcm, loss='mean_squared_error', metrics=['mse'])
-
-    model_init_isc, model_init_isc_w = ModelInitISC(ind=2)
-    adam = optimizers.Adam(lr=1e-2, clipnorm=1.)
-    model_init_isc.compile(adam, loss='mean_squared_error', metrics=['mse'])
-    model_init_isc.summary()
-
-    sess = K.get_session()
-    sess.run(tf.global_variables_initializer())
-    model_jcm_unscaled.load_weights('/home/shmoon/model/production/sv_model_p2/init.h5')
-
-    ind = 0
-    ind_list = list()
-    x_sv = list()
-    y_sv = list()
-    for test_data_npz in trn0[:2]:
-        # Initializes global variables in the graph.
-        test_data = np.load(test_data_npz, allow_pickle=True)
-        d = cf.load_npz(test_data, ref='VG_SV', to3d=True, trim=True, normalize_abp=True)
-        col_dict = d['col_dict']
-
-        if len(d['timestamp']):
-            ind_list.extend([ind] * len(d['timestamp']))
-            ind += 1
-            x_sv.append(cf.smoothing_result(model_jcm_unscaled.predict(d['abp']), d['timestamp'], type='datetime'))
-            y_sv.append(d['feature'][:, col_dict['VG_SV']])
-
-    x_sv = np.concatenate(x_sv, axis=0)
-    y_sv = np.concatenate(y_sv, axis=0)
-    ind_list = np.array(ind_list)
-    ind_cat = to_categorical(ind_list)
-
-    last_mse = None
-    while True:
-        mse = model_init_isc.train_on_batch((x_sv, ind_cat), y_sv)[0]
-        print('after', model_init_isc_w.get_weights(), mse)
-        if last_mse is None:
-            last_mse = mse
-        elif mse >= last_mse:
-            break
-        else:
-            last_mse = mse
-
-    print(model_init_isc_w.get_weights())
-    exit(1)
-
-
-#GetInitISC()
-# python3 ./ModelsJM.py -t VG_SV -m JCM -f sv_model_p2 -g 0 -v vdns -d trn0 trn1 -i
-# python3 ./ModelsJM.py com -t VG_SV -m JCM -f sv_model_p2 -g 0 -v vdns -d trn0 trn1
-# python3 ./ModelsJM.py -t EV_SVV -m JCM -d trn0 trn1 trn2 trn3 -g 1 -f svv_jcm -r
-
-
+        assert False, 'Unknown command %s.' % args.action
