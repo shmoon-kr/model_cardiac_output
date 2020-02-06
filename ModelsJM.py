@@ -7,10 +7,16 @@
 # python3 ./ModelsJM.py init -m sv_model_jm_0 -t VG_SV -b JM -g 0 -d trn0 trn1
 # python3 ./ModelsJM.py sng -m sv_model_jm_0 -g 0 -d trn0 trn1 -f origin
 
+# python3 ./ModelsJM.py init -m sv_model_p3 -t VG_SV -b JCM -g 0 -d trn0 trn1
+# python3 ./ModelsJM.py sng -m sv_model_p3 -g 0 -d trn0 trn1 -f origin -r origin
+
 # python3 ./ModelsJM.py sng -m sv_model_jm_0 -g 0 -d trn0 trn1 -f origin
-# python3 ./ModelsJM.py eval -d test -f eval_02
+# python3 ./ModelsJM.py eval -d test -f eval_03
 # python3 ./ModelsJM.py exp -m sv_model_p0 -f optimum
 # python3 ./ModelsJM.py testdata -d test
+
+# python3 ./ModelsJM.py init -m sv_model_p4 -t VG_SV -b JCM -g 0 -d trn0 trn1
+# python3 ./ModelsJM.py sisc -m sv_model_p4 -g 1 -d trn0 trn1 -f optimum
 
 
 import os
@@ -20,6 +26,7 @@ import datetime
 import argparse
 import MySQLdb
 import random
+import math
 import CommonFunction as cf
 import tensorflow as tf
 import numpy as np
@@ -28,7 +35,7 @@ from math import ceil, sqrt
 from sklearn.metrics import mean_squared_error
 from matplotlib.dates import DateFormatter
 from scipy.stats import pearsonr, trim_mean, gmean
-from tensorflow.python.keras import optimizers, backend as K
+from tensorflow.python.keras import optimizers, backend, callbacks as K
 from tensorflow.python.keras.utils import to_categorical
 from tensorflow.python.keras.models import Sequential, Input, Model
 from tensorflow.python.keras.layers import Conv1D, MaxPool1D, AveragePooling1D, GlobalAveragePooling1D, Dense, Dropout, Reshape, Concatenate, Flatten, Lambda
@@ -327,6 +334,15 @@ def freeze_session(session, keep_var_names=None, output_names=None, clear_device
         frozen_graph = tf.graph_util.convert_variables_to_constants(
             session, input_graph_def, output_names, freeze_var_names)
         return frozen_graph
+
+
+# learning rate schedule
+def step_decay(epoch):
+    initial_lrate = 1e-4
+    drop = 0.5
+    epochs_drop = 1000.0
+    lrate = initial_lrate * math.pow(drop, math.floor((1 + epoch) / epochs_drop))
+    return lrate
 
 
 def get_model_info(name):
@@ -728,8 +744,59 @@ def build_single_model(model_name, new_model_file, data, saved_file=None):
     if saved_file is None:
         saved_file = 'init'
     model_unscaled.load_weights(os.path.join(model_dir, model_info['name'], '%s.h5' % saved_file))
-    model_unscaled.fit(x, y, epochs=200, batch_size=1024)
+    model_scaled.fit(x, y, epochs=200, batch_size=1024)
     model_unscaled.save(os.path.join(model_dir, model_info['name'], '%s.h5' % new_model_file))
+    return
+
+
+def build_single_isc_model(model_name, new_model_file, data, saved_file=None):
+    model_info = get_model_info(model_name)
+
+    if model_info['base'] == 'JCM':
+        model_unscaled, model_scaled, model_isc = ModelJCM(ind=max_individual)
+        adam = optimizers.Adam(lr=1e-4, clipnorm=1.)
+        model_scaled.compile(adam, loss='mean_squared_error', metrics=['mse'])
+    elif model_info['base'] == 'JM':
+        model_unscaled, model_scaled, model_isc = ModelJM(ind=max_individual)
+        adam = optimizers.Adam(lr=1e-4, clipnorm=1.)
+        model_scaled.compile(adam, loss='mean_squared_error', metrics=['mse'])
+    else:
+        assert False
+
+    x = list()
+    y = list()
+    ind = list()
+
+    for i, npz in enumerate(data):
+        t_data = np.load(npz, allow_pickle=True)
+        d = cf.load_npz(t_data, ref=model_info['ref'], to3d=True, trim=True, normalize_abp=True, input_len=1024)
+        if d['timestamp'].shape[0]:
+            col_dict = d['col_dict']
+            x.append(d['abp'])
+            y.append(d['feature'][:, col_dict[model_info['ref']], :])
+            ind.append([i] * len(d['timestamp']))
+
+    x = np.concatenate(x)
+    y = np.concatenate(y)
+    ind = to_categorical(np.concatenate(ind), num_classes=max_individual)
+    assert len(x) == len(y) == len(ind), 'Different lengths.'
+
+    if model_info['base'] == 'JM':
+        x = x[:, -300:]
+
+    if saved_file is None:
+        saved_file = 'init'
+    model_unscaled.load_weights(os.path.join(model_dir, model_info['name'], '%s.h5' % saved_file))
+    model_scaled.fit((x, ind), y, epochs=5000, batch_size=1024, callbacks=[K.LearningRateScheduler(step_decay)])
+    model_unscaled.save(os.path.join(model_dir, model_info['name'], '%s.h5' % new_model_file))
+
+    db_pred = MySQLdb.connect(host='localhost', user='shmoon', password='ibsntxmes', db='sv_trend_model')
+    cursor = db_pred.cursor()
+    query = 'UPDATE model_k SET scale=%f WHERE id=%d' % (gmean(model_isc.get_weights()[0][:len(data)]), model_info['id'])
+    cursor.execute(query)
+    db_pred.commit()
+    db_pred.close()
+
     return
 
 
@@ -753,14 +820,16 @@ def evaluate_models(file_name, evaluation_data):
         col_dict_pred[t] = len(col_dict_pred)
 
     model_jcm, _, _ = ModelJCM(ind=max_individual)
+    model_non_isc, _, _ = ModelJCM(ind=max_individual)
     model_jm, _, _ = ModelJM(ind=max_individual)
 
     model_jcm.load_weights(os.path.join(model_dir, 'sv_model_p0', 'optimum.h5'))
+    model_non_isc.load_weights(os.path.join(model_dir, 'sv_model_p4', 'optimum.h5'))
     model_jm.load_weights(os.path.join(model_dir, 'sv_model_jm_0', 'origin.h5'))
 
     result_mse = list()
     result_pcr = list()
-    result_title = ['dataset', 'EV1000', 'JCM Old', 'JCM New', 'Zander']
+    result_title = ['dataset', 'EV1000', 'JCM Old', 'JCM New', 'JM', 'Zander', 'Non ISC']
     result_npzs = list()
 
     '''
@@ -833,6 +902,8 @@ def evaluate_models(file_name, evaluation_data):
 
                 predict_jcm = model_jcm.predict(t_data['abp'], batch_size=1024)
                 predict_jcm = cf.smoothing_result(predict_jcm, t_data['timestamp'], type='datetime')
+                predict_non_isc = model_non_isc.predict(t_data['abp'], batch_size=1024)
+                predict_non_isc = cf.smoothing_result(predict_non_isc, t_data['timestamp'], type='datetime')
                 predict_jm = model_jm.predict(t_data['abp'][:, -300:, :], batch_size=1024)
                 predict_jm = cf.smoothing_result(predict_jm, t_data['timestamp'], type='datetime')
                 sv_old = cf.smoothing_result(sv_old, t_data['timestamp'], type='datetime')
@@ -851,6 +922,7 @@ def evaluate_models(file_name, evaluation_data):
                     sbp = tmp[col_dict_npz['GE_ART1_SBP']]
                     dbp = tmp[col_dict_npz['GE_ART1_DBP']]
                     predict_jcm[i] *= 1.3
+                    predict_non_isc[i] *= 1.0
                     sv_h.append(sbp*2/3+dbp/3-dbp)
                     sv_z.append((sbp-dbp)/(sbp+dbp))
 
@@ -860,6 +932,7 @@ def evaluate_models(file_name, evaluation_data):
                 tmp_pcr.append(pearsonr(sv_vg, predict_jcm)[0][0])
                 tmp_pcr.append(pearsonr(sv_vg, predict_jm)[0][0])
                 tmp_pcr.append(pearsonr(sv_vg, sv_z)[0][0])
+                tmp_pcr.append(pearsonr(sv_vg, predict_non_isc)[0][0])
                 result_pcr.append(tmp_pcr)
 
                 tmp_mse = list()
@@ -868,6 +941,7 @@ def evaluate_models(file_name, evaluation_data):
                 tmp_mse.append(sqrt(mean_squared_error(sv_vg, predict_jcm)))
                 tmp_mse.append(sqrt(mean_squared_error(sv_vg, predict_jm)))
                 tmp_mse.append(0)
+                tmp_mse.append(sqrt(mean_squared_error(sv_vg, predict_non_isc)))
                 #tmp_mse.append(mean_squared_error(sv_vg, sv_z))
                 result_mse.append(tmp_mse)
 
@@ -881,7 +955,8 @@ def evaluate_models(file_name, evaluation_data):
                 plt.plot(t_data['timestamp'], sv_vg, color='red')
                 plt.plot(t_data['timestamp'], sv_ev, color='orange')
                 plt.plot(t_data['timestamp'], predict_jcm, color='blue')
-                plt.plot(t_data['timestamp'], predict_jm, color='green')
+                #plt.plot(t_data['timestamp'], predict_jm, color='green')
+                plt.plot(t_data['timestamp'], predict_non_isc, color='green')
                 plt.legend(['SV, Vig', 'SV, EV', 'SV, JCM_New', 'SV, JM'], loc='upper right')
 
                 ax = plt.subplot(2, 2, 2)
@@ -904,7 +979,9 @@ def evaluate_models(file_name, evaluation_data):
                 plt.plot(t_data['timestamp'], sv_vg, color='red')
                 plt.plot(t_data['timestamp'], cf.normalize_result(sv_ev, mu=tgt_mean, sigma=tgt_std), color='orange')
                 plt.plot(t_data['timestamp'], cf.normalize_result(predict_jcm, mu=tgt_mean, sigma=tgt_std), color='blue')
-                plt.plot(t_data['timestamp'], cf.normalize_result(predict_jm, mu=tgt_mean, sigma=tgt_std), color='green')
+                #plt.plot(t_data['timestamp'], cf.normalize_result(predict_jm, mu=tgt_mean, sigma=tgt_std), color='green')
+                plt.plot(t_data['timestamp'], cf.normalize_result(predict_non_isc, mu=tgt_mean, sigma=tgt_std),
+                         color='green')
                 plt.plot(t_data['timestamp'], cf.normalize_result(sv_old, mu=tgt_mean, sigma=tgt_std), color='olive')
                 plt.plot(t_data['timestamp'], cf.normalize_result(sv_z, mu=tgt_mean, sigma=tgt_std), color='purple')
                 plt.legend(['SV, Vig', 'SV, EV', 'SV, JCM_New', 'SV, JCM_Old', 'SV, Zander'], loc='upper right')
@@ -1073,6 +1150,10 @@ if __name__ == "__main__":
         assert args.model is not None, 'No model name was specified.'
         assert args.file is not None, 'No file name was specified.'
         build_single_model(args.model, args.file, data, args.resume)
+    elif args.command == 'sisc':
+        assert args.model is not None, 'No model name was specified.'
+        assert args.file is not None, 'No file name was specified.'
+        build_single_isc_model(args.model, args.file, data, args.resume)
     elif args.command == 'eval':
         assert args.file is not None, 'No file name was specified.'
         evaluate_models(args.file, data)

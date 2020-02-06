@@ -1,3 +1,10 @@
 venv/*
 .idea/*
 *.pyc
+jm_classes.py
+jm_models.py
+jm_model_test.py
+Models.py
+CNNTest.py
+ResultAnalysis.py
+sv_daily.py
